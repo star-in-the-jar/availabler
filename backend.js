@@ -3,21 +3,10 @@ import fs from "fs";
 import { authenticate } from "@google-cloud/local-auth";
 import path from "path";
 import dotenv from "dotenv";
+import cors from "cors";
 
 dotenv.config();
-
 const LOCALE = "pl-PL";
-
-const CONSIDERED_DAYS = [1, 2, 3, 4, 5];
-const CONSIDERED_RANGE = {
-  start: "08:00",
-  end: "10:00",
-};
-
-const CONSIDERED_TIMELINE = {
-  time: CONSIDERED_RANGE,
-  days: CONSIDERED_DAYS,
-};
 
 const splitTimeRange = (timeline) => {
   const [start, end] = timeline.split(" - ");
@@ -165,27 +154,57 @@ const createTimeFromFormat = (timeString) => {
   );
 };
 
-const trimToConsideredRange = (freeTimes, consideredRange) => {
-  return freeTimes
+const removeShortBlocks = (schedule, minLength) => {
+  const result = schedule.reduce((acc, time) => {
+    const [_date, times] = time.split(": ");
+    const durationInMinutes = times.split(",").reduce((total, timeRange) => {
+      const [start, end] = timeRange.split(" - ");
+      const startDate = createTimeFromFormat(start);
+      const endDate = createTimeFromFormat(end);
+      return total + (endDate - startDate) / (1000 * 60); // Convert milliseconds to minutes
+    }, 0);
+
+    if (durationInMinutes >= minLength) {
+      return [...acc, time];
+    }
+
+    return acc;
+  }, []);
+  return result;
+};
+
+const trimToConsideredRange = (
+  freeTimes,
+  consideredRange,
+  consideredMinLength
+) => {
+  const trimmedSchedule = freeTimes
     .filter((time) => {
-      const [date, range] = time.split(": ");
+      const [date, _range] = time.split(": ");
       const freeTimeDay = getDayOfWeekIndex(date);
       const isDayInRange = checkDayInRange(freeTimeDay, consideredRange.days);
       return isDayInRange;
     })
-    .map((time) => {
+    .reduce((acc, time) => {
       const [date, range] = time.split(": ");
       const freeTimeProps = checkTimeInRange(range, consideredRange.time);
-      const formatted =
-        date +
-        ": [" +
-        formatDateToHHMM(freeTimeProps.trimmed.start) +
-        " - " +
-        formatDateToHHMM(freeTimeProps.trimmed.end) +
-        "]";
-
-      return formatted;
-    });
+      if (freeTimeProps.trimmed.start < freeTimeProps.trimmed.end) {
+        const formatted =
+          date +
+          ": " +
+          formatDateToHHMM(freeTimeProps.trimmed.start) +
+          " - " +
+          formatDateToHHMM(freeTimeProps.trimmed.end) +
+          "";
+        acc.push(formatted);
+      }
+      return acc;
+    }, []);
+  const scheduleWithoutShortBlocks = removeShortBlocks(
+    trimmedSchedule,
+    consideredMinLength
+  );
+  return scheduleWithoutShortBlocks;
 };
 
 const formatDateToHHMM = (date) => {
@@ -205,35 +224,68 @@ const combineScheduleByDate = (schedule) => {
   }, {});
 };
 
-const mapScheduleDateToDayOfWeek = (schedule) =>
-  Object.entries(schedule).map(([date, times]) => {
+const mapScheduleDateToDayOfWeek = (schedule) => {
+  const unsorted = Object.entries(schedule).map(([date, times]) => {
     const dayIdx = getDayOfWeekIndex(date);
     const dayOfWeek = getDayOfWeek(dayIdx, LOCALE);
     return { [dayOfWeek]: times };
   });
 
-const printFreeTimeSchedule = (schedule) => {
-  for (const day of schedule) {
-    const [dayName, times] = Object.entries(day)[0];
-    console.log(dayName + ":");
-    times.forEach((time) => console.log(time));
-  }
+  const sortedFromTodaysDate = unsorted.sort((a, b) => {
+    const today = new Date();
+    const dateA = new Date(a);
+    const dateB = new Date(b);
+    return dateA - today - (dateB - today);
+  });
+
+  return sortedFromTodaysDate;
 };
 
-const getFinalFreeSchedule = async () => {
-  const auth = await authGoogle();
+const getFinalFreeSchedule = async (dayRange, hourRange, meetingLength) => {
+  const auth = await authGoogle(process.env.NODE_ENV === "development");
   const busyTimes = await getBusySchedule(auth);
   const freeFormattedSchedule = getFreeSchedule(busyTimes);
 
   const freeScheduleInRange = trimToConsideredRange(
     freeFormattedSchedule,
-    CONSIDERED_TIMELINE
+    {
+      time: { start: `${hourRange[0]}:00`, end: `${hourRange[1]}:00` },
+      days: dayRange,
+    },
+    meetingLength
   );
 
   const freeScheduleByDate = combineScheduleByDate(freeScheduleInRange);
-  const freeScheduleByDayOfWeek = mapScheduleDateToDayOfWeek(freeScheduleByDate);
-  printFreeTimeSchedule(freeScheduleByDayOfWeek);
-  return freeScheduleByDayOfWeek;
-}
+  const freeScheduleByDayOfWeek =
+    mapScheduleDateToDayOfWeek(freeScheduleByDate);
 
-getFinalFreeSchedule().catch(console.error);
+  return freeScheduleByDayOfWeek;
+};
+
+import express from "express";
+
+const app = express();
+app.use(cors());
+const PORT = 3000;
+
+app.get("/api/free-schedule", async (req, res) => {
+  const { days, hoursRange, meetingLength } = req.query;
+  try {
+    const dayRange = days.split(",").map(Number);
+    const hourRange = hoursRange.split(",").map(Number);
+    const freeSchedule = await getFinalFreeSchedule(
+      dayRange,
+      hourRange,
+      meetingLength
+    );
+    res.json(freeSchedule);
+    console.log(freeSchedule);
+  } catch (error) {
+    console.error("Error fetching free schedule:", error);
+    res.status(500).send("Internal Server Error");
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running at http://localhost:${PORT}`);
+});
